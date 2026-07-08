@@ -19,8 +19,8 @@ import {
 } from "lucide-react";
 
 // ─── Constants ────────────────────────────────────────────────
-const MIN_DURATION = 3;
-const MAX_DURATION = 60;
+const MIN_DURATION = 30;
+const MAX_DURATION = 45;
 
 export default function PronunciationAssessor() {
   // State management
