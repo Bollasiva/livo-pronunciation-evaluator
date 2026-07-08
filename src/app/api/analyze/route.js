@@ -1,15 +1,155 @@
-import { NextResponse } from "next/server";
+﻿import { NextResponse } from "next/server";
 import Groq from "groq-sdk";
 
-// ─── Pronunciation Scoring Heuristic ──────────────────────────
-// Since Whisper does not output per-word confidence natively in a
-// reliable way, we use a structural-linguistic proxy to simulate
-// an accuracy score. This heuristic considers:
-//   1. Word length vs. syllable density ratio
-//   2. Consonant cluster complexity
-//   3. Character diversity / entropy
-//   4. Timing regularity (words per second)
-// ──────────────────────────────────────────────────────────────
+// =============================================================================
+// SECTION A — Reference Alignment Scoring (primary engine)
+//
+// When the caller provides a `referenceText` ground truth, we perform a full
+// Levenshtein sequence alignment between the reference token list and the
+// Whisper transcript token list, then assign accuracy scores based on:
+//   • Exact / near-match  → 97
+//   • Substitution        → similarity-scaled score (40–79) via char-Levenshtein
+//   • Insertion           → 30  (word exists in transcript but not in reference)
+//   • Deletion            → 0   (reference word omitted from transcript)
+// =============================================================================
+
+/** Character-level Levenshtein distance between two strings. */
+function levenshtein(a, b) {
+  const m = a.length;
+  const n = b.length;
+  const dp = Array.from({ length: m + 1 }, (_, i) =>
+    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (a[i - 1] === b[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1];
+      } else {
+        dp[i][j] = 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+  return dp[m][n];
+}
+
+/** Compute a word similarity ratio (0–1) between two cleaned words. */
+function wordSimilarity(a, b) {
+  const ca = a.toLowerCase().replace(/[^a-z]/g, "");
+  const cb = b.toLowerCase().replace(/[^a-z]/g, "");
+  if (ca === cb) return 1;
+  if (ca.length === 0 || cb.length === 0) return 0;
+  const dist = levenshtein(ca, cb);
+  return 1 - dist / Math.max(ca.length, cb.length);
+}
+
+/**
+ * Sequence alignment via Levenshtein DP on word arrays.
+ * Returns an edit-script array: { op, ref?, hyp?, similarity? }
+ */
+function alignSequences(refTokens, hypSegments) {
+  const R = refTokens.length;
+  const H = hypSegments.length;
+
+  const cost = Array.from({ length: R + 1 }, (_, i) =>
+    Array.from({ length: H + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+
+  for (let i = 1; i <= R; i++) {
+    for (let j = 1; j <= H; j++) {
+      const sim = wordSimilarity(refTokens[i - 1], hypSegments[j - 1].word);
+      const subCost = sim >= 0.85 ? 0 : 1 - sim;
+      cost[i][j] = Math.min(
+        cost[i - 1][j - 1] + subCost,
+        cost[i - 1][j] + 1,
+        cost[i][j - 1] + 1
+      );
+    }
+  }
+
+  // Traceback
+  const ops = [];
+  let i = R;
+  let j = H;
+
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0) {
+      const sim = wordSimilarity(refTokens[i - 1], hypSegments[j - 1].word);
+      const subCost = sim >= 0.85 ? 0 : 1 - sim;
+      if (cost[i][j] === cost[i - 1][j - 1] + subCost) {
+        ops.unshift({
+          op: sim >= 0.85 ? "match" : "substitution",
+          ref: refTokens[i - 1],
+          hyp: hypSegments[j - 1],
+          similarity: sim,
+        });
+        i--;
+        j--;
+        continue;
+      }
+    }
+    if (i > 0 && (j === 0 || cost[i][j] === cost[i - 1][j] + 1)) {
+      ops.unshift({ op: "deletion", ref: refTokens[i - 1] });
+      i--;
+    } else {
+      ops.unshift({ op: "insertion", hyp: hypSegments[j - 1] });
+      j--;
+    }
+  }
+
+  return ops;
+}
+
+/** Convert an alignment operation into a scored word result object. */
+function opToWordResult(op) {
+  switch (op.op) {
+    case "match":
+      return {
+        word: op.hyp.word,
+        start: op.hyp.start,
+        end: op.hyp.end,
+        accuracyScore: 97,
+        errorType: "None",
+        alignOp: "match",
+      };
+    case "substitution": {
+      const score = Math.round(40 + (op.similarity * (79 - 40)) / 0.84);
+      return {
+        word: op.hyp.word,
+        start: op.hyp.start,
+        end: op.hyp.end,
+        accuracyScore: Math.min(score, 79),
+        errorType: score < 60 ? "Mispronounced" : "Unclear",
+        expectedWord: op.ref,
+        alignOp: "substitution",
+      };
+    }
+    case "insertion":
+      return {
+        word: op.hyp.word,
+        start: op.hyp.start,
+        end: op.hyp.end,
+        accuracyScore: 30,
+        errorType: "Mispronounced",
+        alignOp: "insertion",
+      };
+    case "deletion":
+      return {
+        word: "[" + op.ref + "]",
+        start: null,
+        end: null,
+        accuracyScore: 0,
+        errorType: "Mispronounced",
+        expectedWord: op.ref,
+        alignOp: "deletion",
+      };
+    default:
+      return null;
+  }
+}
+
+// =============================================================================
+// SECTION B — Heuristic Scoring (fallback when no reference is provided)
+// =============================================================================
 
 function countSyllables(word) {
   const w = word.toLowerCase().replace(/[^a-z]/g, "");
@@ -22,9 +162,7 @@ function countSyllables(word) {
     if (isVowel && !prevVowel) count++;
     prevVowel = isVowel;
   }
-  // Adjust for silent 'e'
   if (w.endsWith("e") && count > 1) count--;
-  // Adjust for endings like -le
   if (w.endsWith("le") && w.length > 2 && !vowels.includes(w[w.length - 3])) {
     count++;
   }
@@ -36,14 +174,14 @@ function consonantClusterComplexity(word) {
   const clusters = w.match(/[^aeiouy]{2,}/g) || [];
   if (clusters.length === 0) return 0;
   const maxLen = Math.max(...clusters.map((c) => c.length));
-  return Math.min(maxLen / 4, 1); // Normalize 0–1
+  return Math.min(maxLen / 4, 1);
 }
 
 function charDiversity(word) {
   const w = word.toLowerCase().replace(/[^a-z]/g, "");
   if (w.length === 0) return 0;
   const unique = new Set(w.split("")).size;
-  return unique / w.length; // 0–1, higher = more diverse
+  return unique / w.length;
 }
 
 function computeWordScore(word, durationSec) {
@@ -54,58 +192,42 @@ function computeWordScore(word, durationSec) {
   const clusterPenalty = consonantClusterComplexity(cleaned);
   const diversity = charDiversity(cleaned);
 
-  // Base score starts at 82 – encourages most words to pass
   let score = 82;
-
-  // Syllable density bonus: medium-length words are easiest
   const lenFactor = cleaned.length;
   if (lenFactor >= 3 && lenFactor <= 8) {
     score += 6;
   } else if (lenFactor > 8) {
-    // Longer words are harder to pronounce clearly
     score -= Math.min((lenFactor - 8) * 1.5, 12);
   } else {
-    // Very short words (1-2 chars) – usually fine
     score += 3;
   }
 
-  // Syllable count adjustment
   if (syllables >= 2 && syllables <= 3) {
     score += 4;
   } else if (syllables > 3) {
     score -= (syllables - 3) * 3;
   }
 
-  // Character diversity bonus – varied characters suggest clearer diction
   score += diversity * 8;
-
-  // Consonant cluster penalty – harder to articulate clearly
   score -= clusterPenalty * 15;
 
-  // Duration-based timing analysis
   if (durationSec > 0) {
     const syllablesPerSec = syllables / durationSec;
-    // Normal speech: 3-5 syllables/sec for a single word
     if (syllablesPerSec < 1) {
-      // Abnormally slow – possible hesitation
       score -= 8;
     } else if (syllablesPerSec > 8) {
-      // Abnormally fast – possible mumbling
       score -= 10;
     }
   }
 
-  // Add controlled randomness for natural variation (seeded by word chars)
   const charSum = cleaned
     .split("")
     .reduce((acc, c) => acc + c.charCodeAt(0), 0);
-  const pseudoRandom = ((charSum * 7 + cleaned.length * 13) % 17) - 8; // -8 to +8
+  const pseudoRandom = ((charSum * 7 + cleaned.length * 13) % 17) - 8;
   score += pseudoRandom * 0.7;
 
-  // Clamp to 0-100
   score = Math.max(0, Math.min(100, Math.round(score * 10) / 10));
 
-  // Classify error type
   let errorType = "None";
   if (score < 60) {
     errorType = "Mispronounced";
@@ -116,30 +238,29 @@ function computeWordScore(word, durationSec) {
   return { score, errorType };
 }
 
-// ─── Predefined Mock Fallback Generator ───────────────────────
+// =============================================================================
+// SECTION C — Demo fallback (no API key configured)
+// =============================================================================
+
 function getMockResult() {
-  const mockText = "Hello and welcome to VoiceAssess Pronunciation. We are evaluating your speech clarity, fluency, and articulation under the Digital Personal Data Protection Act of India. Good luck.";
+  const mockText =
+    "Hello and welcome to VoiceAssess Pronunciation. We are evaluating your speech clarity, fluency, and articulation under the Digital Personal Data Protection Act of India. Good luck.";
   const mockWordsList = mockText.split(" ");
-  
+
   const processedWords = mockWordsList.map((w, index) => {
     const cleanWord = w.replace(/[^a-zA-Z]/g, "");
     let score = 92;
     let errorType = "None";
 
     if (cleanWord.toLowerCase().includes("assess")) {
-      score = 42;
-      errorType = "Mispronounced";
+      score = 42; errorType = "Mispronounced";
     } else if (cleanWord.toLowerCase() === "clarity") {
-      score = 68;
-      errorType = "Unclear";
+      score = 68; errorType = "Unclear";
     } else if (cleanWord.toLowerCase() === "digital") {
-      score = 55;
-      errorType = "Mispronounced";
+      score = 55; errorType = "Mispronounced";
     } else if (cleanWord.toLowerCase() === "fluency") {
-      score = 72;
-      errorType = "Unclear";
+      score = 72; errorType = "Unclear";
     } else {
-      // Add natural variance
       const seed = cleanWord.split("").reduce((acc, c) => acc + c.charCodeAt(0), 0);
       score = Math.max(76, 80 + ((seed * 11) % 20));
     }
@@ -160,6 +281,7 @@ function getMockResult() {
     overallScore,
     text: mockText,
     words: processedWords,
+    scoringEngine: "demo-mock-fallback",
     metadata: {
       wordCount: processedWords.length,
       duration: processedWords.length * 0.45,
@@ -176,7 +298,9 @@ function getMockResult() {
   };
 }
 
-// ─── API Route Handler ────────────────────────────────────────
+// =============================================================================
+// SECTION D — API Route Handler
+// =============================================================================
 
 export async function POST(request) {
   try {
@@ -184,6 +308,7 @@ export async function POST(request) {
     const formData = await request.formData();
     const audioFile = formData.get("audio");
     const consent = formData.get("consent");
+    const referenceText = (formData.get("referenceText") || "").trim();
 
     // 2. DPDP Compliance – Strict consent verification
     if (consent !== "true") {
@@ -207,7 +332,7 @@ export async function POST(request) {
       );
     }
 
-    // Enforce reasonable file size limit (25 MB – Groq's limit)
+    // Enforce reasonable file size limit (25 MB – Groq limit)
     const MAX_SIZE = 25 * 1024 * 1024;
     if (audioFile.size > MAX_SIZE) {
       return NextResponse.json(
@@ -220,12 +345,11 @@ export async function POST(request) {
     const arrayBuffer = await audioFile.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    // Construct a File object for Groq SDK
     const fileName = audioFile.name || "recording.webm";
     const mimeType = audioFile.type || "audio/webm";
     const fileForGroq = new File([buffer], fileName, { type: mimeType });
 
-    // 5. Initialize Groq client with demo fallback capability
+    // 5. Demo fallback when no valid API key is set
     const groqApiKey = process.env.GROQ_API_KEY;
     if (!groqApiKey || groqApiKey === "your_groq_api_key_here") {
       console.warn("GROQ_API_KEY is not configured. Falling back to Demo Mode.");
@@ -244,7 +368,7 @@ export async function POST(request) {
         language: "en",
       });
 
-      // 7. Process word segments and compute scores
+      // 7. Process word segments
       const rawWords = transcription.words || [];
 
       if (rawWords.length === 0) {
@@ -258,22 +382,44 @@ export async function POST(request) {
         );
       }
 
-      const processedWords = rawWords.map((segment) => {
-        const duration = (segment.end || 0) - (segment.start || 0);
-        const { score, errorType } = computeWordScore(
-          segment.word || "",
-          duration
-        );
-        return {
-          word: segment.word || "",
-          start: Math.round((segment.start || 0) * 1000) / 1000,
-          end: Math.round((segment.end || 0) * 1000) / 1000,
-          accuracyScore: score,
-          errorType,
-        };
-      });
+      // Normalise timing on each segment
+      const hypSegments = rawWords.map((seg) => ({
+        word: seg.word || "",
+        start: Math.round((seg.start || 0) * 1000) / 1000,
+        end: Math.round((seg.end || 0) * 1000) / 1000,
+      }));
 
-      // 8. Calculate aggregate overall score
+      let processedWords;
+      let scoringEngine;
+
+      if (referenceText.length > 0) {
+        // ── ALIGNMENT-BASED SCORING ────────────────────────────
+        const refTokens = referenceText
+          .toLowerCase()
+          .replace(/[^a-z\s'-]/g, "")
+          .split(/\s+/)
+          .filter(Boolean);
+
+        const ops = alignSequences(refTokens, hypSegments);
+        processedWords = ops.map(opToWordResult).filter(Boolean);
+        scoringEngine = "reference-alignment";
+      } else {
+        // ── HEURISTIC SCORING FALLBACK ─────────────────────────
+        processedWords = hypSegments.map((seg) => {
+          const duration = seg.end - seg.start;
+          const { score, errorType } = computeWordScore(seg.word, duration);
+          return {
+            word: seg.word,
+            start: seg.start,
+            end: seg.end,
+            accuracyScore: score,
+            errorType,
+          };
+        });
+        scoringEngine = "heuristic";
+      }
+
+      // 8. Aggregate overall score
       const totalScore = processedWords.reduce(
         (sum, w) => sum + w.accuracyScore,
         0
@@ -281,16 +427,18 @@ export async function POST(request) {
       const overallScore =
         Math.round((totalScore / processedWords.length) * 10) / 10;
 
-      // 9. Build response – buffer goes out of scope for GC
+      // 9. Build response
       const response = {
         overallScore,
         text: transcription.text || "",
         words: processedWords,
+        scoringEngine,
         metadata: {
           wordCount: processedWords.length,
-          duration: rawWords.length
-            ? rawWords[rawWords.length - 1].end - rawWords[0].start
-            : 0,
+          duration:
+            rawWords.length
+              ? rawWords[rawWords.length - 1].end - rawWords[0].start
+              : 0,
           mispronunciations: processedWords.filter(
             (w) => w.errorType === "Mispronounced"
           ).length,
@@ -308,9 +456,10 @@ export async function POST(request) {
 
       return NextResponse.json(response, { status: 200 });
     } catch (groqError) {
-      // Check if it's an API Key / Auth error
       if (groqError?.status === 401) {
-        console.warn("Invalid GROQ_API_KEY. Falling back to Demo Mode for verification.");
+        console.warn(
+          "Invalid GROQ_API_KEY. Falling back to Demo Mode for verification."
+        );
         return NextResponse.json(getMockResult(), { status: 200 });
       }
       throw groqError;
@@ -318,7 +467,6 @@ export async function POST(request) {
   } catch (error) {
     console.error("[Pronunciation API Error]", error);
 
-    // Handle Groq-specific errors
     if (error?.status === 413) {
       return NextResponse.json(
         { error: "Audio file too large for processing" },

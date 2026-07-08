@@ -19,8 +19,8 @@ import {
 } from "lucide-react";
 
 // ─── Constants ────────────────────────────────────────────────
-const MIN_DURATION = 30;
-const MAX_DURATION = 45;
+const MIN_DURATION = 3;
+const MAX_DURATION = 60;
 
 export default function PronunciationAssessor() {
   // State management
@@ -36,6 +36,9 @@ export default function PronunciationAssessor() {
   const [error, setError] = useState(null);
   const [durationError, setDurationError] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [dragOver, setDragOver] = useState(false); // hoisted to avoid TDZ
+  const [consentError, setConsentError] = useState(false); // for missing-consent UX
+  const [referenceText, setReferenceText] = useState(""); // ground-truth input for alignment scoring
 
   // Refs
   const mediaRecorderRef = useRef(null);
@@ -144,8 +147,6 @@ export default function PronunciationAssessor() {
     setDragOver(true);
   };
 
-  const [dragOver, setDragOver] = useState(false);
-
   const handleDrop = useCallback(
     (e) => {
       e.preventDefault();
@@ -180,11 +181,20 @@ export default function PronunciationAssessor() {
       });
       streamRef.current = stream;
 
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-          ? "audio/webm;codecs=opus"
-          : "audio/webm",
-      });
+      // Determine the best supported MIME type — includes Safari/iOS fallback
+      let mimeType = "";
+      if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
+        mimeType = "audio/webm;codecs=opus";
+      } else if (MediaRecorder.isTypeSupported("audio/webm")) {
+        mimeType = "audio/webm";
+      } else if (MediaRecorder.isTypeSupported("audio/mp4")) {
+        mimeType = "audio/mp4"; // Safari 14.1+ / iOS 17+
+      } else if (MediaRecorder.isTypeSupported("audio/aac")) {
+        mimeType = "audio/aac"; // older Apple fallback
+      }
+      // Empty string lets the browser choose its own default codec
+      const recorderOptions = mimeType ? { mimeType } : {};
+      const mediaRecorder = new MediaRecorder(stream, recorderOptions);
 
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
@@ -196,8 +206,11 @@ export default function PronunciationAssessor() {
       };
 
       mediaRecorder.onstop = () => {
-        const blob = new Blob(audioChunksRef.current, { type: "audio/webm" });
-        const file = new File([blob], "recording.webm", { type: "audio/webm" });
+        // Use the actual recorded mime type for blob fidelity
+        const actualType = mimeType || "audio/webm";
+        const ext = actualType.includes("mp4") ? "mp4" : actualType.includes("aac") ? "aac" : "webm";
+        const blob = new Blob(audioChunksRef.current, { type: actualType });
+        const file = new File([blob], `recording.${ext}`, { type: actualType });
         const url = URL.createObjectURL(blob);
         setAudioFile(file);
         setAudioUrl(url);
@@ -244,7 +257,7 @@ export default function PronunciationAssessor() {
       setAudioDuration(prev);
       if (prev < MIN_DURATION) {
         setDurationError(
-          `Recording duration is too short (${prev}s). Please record between 30 and 45 seconds.`
+          `Recording duration is too short (${prev}s). Please record at least ${MIN_DURATION} seconds.`
         );
         setTimeout(() => {
           setAudioFile(null);
@@ -261,8 +274,15 @@ export default function PronunciationAssessor() {
 
   // Submit to Backend API
   const handleSubmit = useCallback(async () => {
-    if (!audioFile || !consent) return;
+    // Show a clear UI error if consent is missing instead of silently doing nothing
+    if (!consent) {
+      setConsentError(true);
+      setTimeout(() => setConsentError(false), 4000);
+      return;
+    }
+    if (!audioFile) return;
 
+    setConsentError(false);
     setError(null);
     setResult(null);
     setIsAnalyzing(true);
@@ -271,6 +291,10 @@ export default function PronunciationAssessor() {
       const formData = new FormData();
       formData.append("audio", audioFile);
       formData.append("consent", "true");
+      // Send reference text to backend for alignment scoring (may be empty)
+      if (referenceText.trim()) {
+        formData.append("referenceText", referenceText.trim());
+      }
 
       const response = await fetch("/api/analyze", {
         method: "POST",
@@ -289,7 +313,7 @@ export default function PronunciationAssessor() {
     } finally {
       setIsAnalyzing(false);
     }
-  }, [audioFile, consent]);
+  }, [audioFile, consent, referenceText]);
 
   // Clear Audio Attachment
   const handleClear = useCallback(() => {
@@ -309,7 +333,8 @@ export default function PronunciationAssessor() {
   const effectiveDuration = isRecording ? recordingSeconds : audioDuration;
   const isDurationValid =
     effectiveDuration >= MIN_DURATION && effectiveDuration <= MAX_DURATION;
-  const canSubmit = consent && audioFile && !isAnalyzing && isDurationValid;
+  // canSubmit allows clicking even without consent so we can show the consent error
+  const canSubmit = audioFile && !isAnalyzing && isDurationValid;
 
   // Render variables
   const progressPercent = Math.min((effectiveDuration / MAX_DURATION) * 100, 100);
@@ -374,6 +399,42 @@ export default function PronunciationAssessor() {
         </div>
       </section>
 
+      {/* ─── 2b. Reference Text Input ────────────────────────── */}
+      <section className="card">
+        <div className="card-header-row">
+          <div className="card-title-group">
+            <div className="card-title-bar" />
+            <h2 className="card-title-label">REFERENCE TEXT <span style={{ fontWeight: 400, fontSize: "10px", color: "var(--text-dim)", textTransform: "none" }}>(optional)</span></h2>
+          </div>
+        </div>
+        <p style={{ fontSize: "12px", color: "var(--text-dim)", marginBottom: "10px" }}>
+          Paste the exact sentence or passage the speaker was supposed to read. When provided, scoring uses word-level alignment rather than the heuristic engine.
+        </p>
+        <textarea
+          id="reference-text-input"
+          rows={3}
+          placeholder="e.g. The quick brown fox jumps over the lazy dog."
+          value={referenceText}
+          onChange={(e) => setReferenceText(e.target.value)}
+          style={{
+            width: "100%",
+            background: "var(--surface-2)",
+            border: "1px solid var(--border)",
+            borderRadius: "8px",
+            padding: "10px 12px",
+            color: "var(--text)",
+            fontSize: "13px",
+            lineHeight: "1.6",
+            resize: "vertical",
+            fontFamily: "inherit",
+            outline: "none",
+            transition: "border-color 0.2s",
+          }}
+          onFocus={(e) => (e.target.style.borderColor = "var(--accent)")}
+          onBlur={(e) => (e.target.style.borderColor = "var(--border)")}
+        />
+      </section>
+
       {/* ─── 3. Audio Submission Card ─────────────────────────── */}
       <section className="card animate-slide-in">
         <div className="card-header-row">
@@ -418,7 +479,7 @@ export default function PronunciationAssessor() {
             {isDurationValid && (
               <div className="status-right">
                 <CheckCircle2 size={13} strokeWidth={2.5} />
-                <span>Target duration met (30–45s)</span>
+                <span>Duration valid ({MIN_DURATION}–{MAX_DURATION}s)</span>
               </div>
             )}
           </div>
@@ -466,7 +527,7 @@ export default function PronunciationAssessor() {
               Drag speech sample here, or <span style={{ color: "var(--accent)" }}>browse</span>
             </p>
             <p style={{ fontSize: "11px", color: "var(--text-dim)", marginTop: "6px" }}>
-              Accepts standard audio files (30–45 seconds)
+              Accepts standard audio files ({MIN_DURATION}–{MAX_DURATION} seconds)
             </p>
           </div>
         ) : (
@@ -491,7 +552,7 @@ export default function PronunciationAssessor() {
             </div>
 
             <p className="mic-helper-text">
-              Recording between 30–45 seconds · auto-stops at 45s
+              Record {MIN_DURATION}–{MAX_DURATION} seconds · auto-stops at {MAX_DURATION}s
             </p>
           </div>
         )}
@@ -522,6 +583,29 @@ export default function PronunciationAssessor() {
             </div>
             
             <audio ref={audioPlaybackRef} src={audioUrl} className="hidden" />
+          </div>
+        )}
+
+        {/* Consent missing error (shown when user clicks Analyze without ticking consent) */}
+        {consentError && (
+          <div
+            className="animate-slide-in"
+            style={{
+              background: "rgba(251, 191, 36, 0.08)",
+              border: "1px solid rgba(251, 191, 36, 0.3)",
+              borderRadius: "10px",
+              padding: "12px 16px",
+              color: "#fbbf24",
+              fontSize: "12.5px",
+              display: "flex",
+              alignItems: "flex-start",
+              gap: "8px",
+            }}
+          >
+            <AlertCircle size={15} style={{ flexShrink: 0, marginTop: "2px" }} />
+            <span>
+              <strong>Consent required.</strong> Please tick the DPDP Act compliance checkbox above before analyzing.
+            </span>
           </div>
         )}
 
@@ -570,8 +654,9 @@ export default function PronunciationAssessor() {
         {/* Analyze Submission Trigger */}
         <button
           className="btn-submit"
-          disabled={!canSubmit}
+          disabled={isAnalyzing || !audioFile || !isDurationValid}
           onClick={handleSubmit}
+          title={!consent ? "Please provide DPDP consent first" : undefined}
         >
           {isAnalyzing ? (
             <>
