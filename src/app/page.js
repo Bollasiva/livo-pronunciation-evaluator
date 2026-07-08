@@ -340,7 +340,7 @@ export default function PronunciationAssessor() {
 
       {/* ─── 2. Consent Banner ─────────────────────────────────── */}
       <section className="card">
-        <label className="consent-container" htmlFor="consent-check">
+        <div className="consent-container">
           <div className="consent-checkbox-wrapper">
             <input
               type="checkbox"
@@ -367,11 +367,11 @@ export default function PronunciationAssessor() {
               </svg>
             </div>
           </div>
-          <div className="consent-text">
+          <label className="consent-text" htmlFor="consent-check" style={{ cursor: "pointer", select: "none" }}>
             I consent to my audio being processed temporarily to assess pronunciation.{" "}
             <strong>Nothing is stored after scoring.</strong>
-          </div>
-        </label>
+          </label>
+        </div>
       </section>
 
       {/* ─── 3. Audio Submission Card ─────────────────────────── */}
