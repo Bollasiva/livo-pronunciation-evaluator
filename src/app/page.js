@@ -20,7 +20,7 @@ import {
 
 // ─── Constants ────────────────────────────────────────────────
 const MIN_DURATION = 30;
-const MAX_DURATION = 45;
+const MAX_DURATION = 60;
 
 export default function PronunciationAssessor() {
   // State management
