@@ -291,10 +291,7 @@ export default function PronunciationAssessor() {
       const formData = new FormData();
       formData.append("audio", audioFile);
       formData.append("consent", "true");
-      // Send reference text to backend for alignment scoring (may be empty)
-      if (referenceText.trim()) {
-        formData.append("referenceText", referenceText.trim());
-      }
+      formData.append("referenceText", referenceText);
 
       const response = await fetch("/api/analyze", {
         method: "POST",
@@ -736,7 +733,10 @@ export default function PronunciationAssessor() {
           <div className="transcript-box">
             {result.words.map((w, index) => {
               const statusClass =
-                w.errorType === "Mispronunciation"
+                w.errorType === "Mispronounced" ||
+                w.errorType === "Mispronunciation" ||
+                w.errorType === "Omission" ||
+                w.errorType === "Insertion"
                   ? "mispronounced"
                   : w.errorType === "Unclear"
                     ? "unclear"

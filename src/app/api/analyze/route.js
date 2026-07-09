@@ -1,4 +1,4 @@
-﻿import { NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import Groq from "groq-sdk";
 
 // =============================================================================
@@ -107,7 +107,7 @@ function opToWordResult(op) {
         word: op.hyp.word,
         start: op.hyp.start,
         end: op.hyp.end,
-        accuracyScore: 97,
+        accuracyScore: 100,
         errorType: "None",
         alignOp: "match",
       };
@@ -118,7 +118,7 @@ function opToWordResult(op) {
         start: op.hyp.start,
         end: op.hyp.end,
         accuracyScore: Math.min(score, 79),
-        errorType: score < 60 ? "Mispronounced" : "Unclear",
+        errorType: "Mispronunciation",
         expectedWord: op.ref,
         alignOp: "substitution",
       };
@@ -129,7 +129,7 @@ function opToWordResult(op) {
         start: op.hyp.start,
         end: op.hyp.end,
         accuracyScore: 30,
-        errorType: "Mispronounced",
+        errorType: "Insertion",
         alignOp: "insertion",
       };
     case "deletion":
@@ -138,7 +138,7 @@ function opToWordResult(op) {
         start: null,
         end: null,
         accuracyScore: 0,
-        errorType: "Mispronounced",
+        errorType: "Omission",
         expectedWord: op.ref,
         alignOp: "deletion",
       };
@@ -391,6 +391,7 @@ export async function POST(request) {
 
       let processedWords;
       let scoringEngine;
+      let overallScore;
 
       if (referenceText.length > 0) {
         // ── ALIGNMENT-BASED SCORING ────────────────────────────
@@ -403,6 +404,13 @@ export async function POST(request) {
         const ops = alignSequences(refTokens, hypSegments);
         processedWords = ops.map(opToWordResult).filter(Boolean);
         scoringEngine = "reference-alignment";
+
+        // Calculate aggregate overall score as the ratio of successfully matched target words to total reference words
+        const matchedTargetWords = processedWords.filter((w) => w.alignOp === "match").length;
+        const totalReferenceWords = refTokens.length;
+        overallScore = totalReferenceWords > 0
+          ? Math.round((matchedTargetWords / totalReferenceWords) * 100 * 10) / 10
+          : 0;
       } else {
         // ── HEURISTIC SCORING FALLBACK ─────────────────────────
         processedWords = hypSegments.map((seg) => {
@@ -417,15 +425,14 @@ export async function POST(request) {
           };
         });
         scoringEngine = "heuristic";
-      }
 
-      // 8. Aggregate overall score
-      const totalScore = processedWords.reduce(
-        (sum, w) => sum + w.accuracyScore,
-        0
-      );
-      const overallScore =
-        Math.round((totalScore / processedWords.length) * 10) / 10;
+        const totalScore = processedWords.reduce(
+          (sum, w) => sum + w.accuracyScore,
+          0
+        );
+        overallScore =
+          Math.round((totalScore / processedWords.length) * 10) / 10;
+      }
 
       // 9. Build response
       const response = {
@@ -440,7 +447,11 @@ export async function POST(request) {
               ? rawWords[rawWords.length - 1].end - rawWords[0].start
               : 0,
           mispronunciations: processedWords.filter(
-            (w) => w.errorType === "Mispronounced"
+            (w) =>
+              w.errorType === "Mispronounced" ||
+              w.errorType === "Mispronunciation" ||
+              w.errorType === "Omission" ||
+              w.errorType === "Insertion"
           ).length,
           unclearWords: processedWords.filter((w) => w.errorType === "Unclear")
             .length,
